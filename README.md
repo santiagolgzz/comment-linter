@@ -1,12 +1,12 @@
 # comment-lint
 
-**Find the comments in your Rust code that repeat, mislead, or have gone out of date.**
+**Find the comments in your Rust and Python code that repeat, mislead, or have gone out of date.**
 
 AI coding agents write a lot of comments. Many of them say what the next line already says (`// create a new HashMap`), or describe the edit instead of the code (`// now uses the new parser`). Worse, some stop being true after the next change. comment-lint finds them for you, so you can cut or fix them.
 
 ![License: MIT](https://img.shields.io/badge/license-MIT-blue)
 ![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue)
-![Checks: Rust](https://img.shields.io/badge/checks-Rust-orange)
+![Checks: Rust and Python](https://img.shields.io/badge/checks-Rust%20%7C%20Python-orange)
 ![Status: prototype](https://img.shields.io/badge/status-prototype-yellow)
 
 ```
@@ -149,7 +149,7 @@ This sends one example request and shows exactly what came back. You should see 
 uv run comment_lint.py path/to/your/project
 ```
 
-Pass a folder to check every `.rs` file inside it (`target/` and hidden folders are skipped), or pass single files.
+Pass a folder to check every `.rs` and `.py` file inside it, or pass single files. Build output, dependencies, hidden folders and vendored code (`target/`, `node_modules/`, `venv/`, `vendor/`, `third_party/`, …) are skipped.
 
 ## Reading the results
 
@@ -262,7 +262,7 @@ comment-lint saves every answer in `.comment-lint-cache.json`, in the folder you
 
 ```mermaid
 flowchart LR
-    A[Rust files] --> B[Find comments<br/>and nearby code]
+    A[Rust and Python files] --> B[Find comments<br/>and nearby code]
     B --> C{Free local checks}
     C -->|TODO / FIXME| T[Listed separately]
     C -->|looks like code| K[COMMENTED_CODE]
@@ -274,12 +274,12 @@ flowchart LR
     T --> R
 ```
 
-1. **Find comments.** [tree-sitter](https://tree-sitter.github.io/) reads each file and finds every `//` and `/* */` comment. Comment lines in a row count as one comment. Doc comments (`///`, `//!`) are left out on purpose (see the [FAQ](#faq)).
+1. **Find comments.** [tree-sitter](https://tree-sitter.github.io/) reads each file and finds every comment: `//` and `/* */` in Rust, `#` in Python. Comment lines in a row count as one comment. Doc comments (`///` and `//!` in Rust) and Python docstrings are left out on purpose (see the [FAQ](#faq)).
 
 2. **Run the free local checks.** Some comments don't need a model:
    - `TODO` and `FIXME` are listed separately.
-   - License headers, `// SAFETY:` notes and tool directives (`rustfmt::`, `clippy::`, `@generated`, …) are skipped and never flagged.
-   - Commented-out code is flagged as `COMMENTED_CODE`. A comment only counts as code if it's valid Rust *and* shows clear signs of code, such as `;`, `=`, `::`, a function call or a `let`. Valid Rust alone isn't enough: short phrases like `// safety` or `// return result` are valid Rust too.
+   - License headers and tool directives are skipped and never flagged. In Rust that means `// SAFETY:` notes, `rustfmt::`, `clippy::`, `@generated` and similar. In Python: `#!` lines, encoding lines, `# noqa`, `# type: ignore`, `# pragma: no cover`, `# fmt: off` and similar.
+   - Commented-out code is flagged as `COMMENTED_CODE`. A comment only counts as code if it's valid code in its language *and* shows clear signs of code, such as `=`, `;`, `::`, a function call, an `import` or a `let`. Being valid code isn't enough on its own: short phrases like `return result` or `Note: important` are valid Rust or Python too.
 
 3. **Ask Jev.** Each remaining comment goes to Jev with the function it sits in, the line before it and the code it describes. Jev answers five yes/no questions, each as a score from 0 to 1:
 
@@ -331,12 +331,12 @@ The full design, and the reasoning behind each choice, is in [SPEC.md](SPEC.md).
 No. It reads your files and prints a report. That's all.
 
 **Which languages does it support?**
-Rust only, for now. The approach isn't Rust-specific, so more languages could come later.
+Rust and Python. The approach doesn't depend on the language, so more could be added.
 
 **Why not ask a big model like Claude or GPT to review every comment?**
 Cost and noise. Jev is built to answer yes/no questions with a score, at a tiny fraction of the price of a large model, so checking every comment stays cheap. Plain rules then decide what's worth flagging. A large model is better used afterwards, on the few comments that get flagged (see [JSON output](#get-the-results-as-json)).
 
-**Why are doc comments (`///`) skipped?**
+**Why are doc comments (`///`) and docstrings skipped?**
 They're written for people reading generated docs or an editor's hover popup, who can't see the function body. Restating what a function does is often exactly right there. They'll need their own rules.
 
 **Why is `// SAFETY:` never flagged?**

@@ -172,12 +172,27 @@ crates/agent-sap/src/cli.rs:39-41       HISTORY     0.91
 - The OpenRouter Python SDK has an `Alpha.Decisions` call, but plain HTTP is simpler and has fewer dependencies.
 - Network: from the SLB network, `docs.typesafe.ai` gets a firewall warning page (category "AI-platform-service"); `openrouter.ai` loads normally. Another reason to build elsewhere.
 
+## Python (added after v1)
+
+Python is supported alongside Rust, with the same questions and rules:
+
+- `#` comments only. Docstrings are strings, not comments, so they're left out, the same way Rust doc comments are.
+- Directives skipped: `#!`, encoding lines, `noqa`, `nosec`, `type:`, `ruff:`, `mypy:`, `pyright:`, `pylint:`, `flake8:`, `isort:`, `pragma:`, `fmt:`.
+- Commented-out code: the text is dedented and parsed as a module. `{`/`}` don't count as code evidence in Python, where braces are data.
+
+Changes to the commented-out-code check found while adding Python, applied to both languages:
+
+- **Literals no longer count as code evidence.** `# mcp < 2.0` and `// capacity >= 9` are labels, but a clean parse plus a number made them "code". Real commented-out code nearly always has stronger evidence (`=`, a call, `;`, a declaration).
+- **A call counts only when `(` directly follows the name.** `Initialize (optional)` parses as a call in both languages.
+- `vendor/` and `third_party/` folders are skipped: they hold other projects' code.
+
 ## Findings from the first live runs
 
 - The request and response shapes match the docs exactly. Requests were served by provider `TypeSafe`. Cost is $0.042 per million input tokens; output tokens are free.
 - About 850 input tokens per comment on average. 245 ripgrep comments took 23 s, cost $0.0088, with no errors.
 - Identical requests vary slightly (for example `restates` 0.62 / 0.63 / 0.65).
 - Scores run lower than the §3 starting thresholds assume. Across 245 ripgrep comments the highest `restates` was 0.85, and an obviously redundant demo comment scored 0.62–0.66, so `REDUNDANT` at 0.90 almost never fires. Calibration (§4) should settle this.
+- On AI-written Python (the monarch MCP repos, 292 comments), scores differ clearly from hand-written Rust (ripgrep, 245): median `restates` 0.29 vs 0.21, 70 vs 18 comments above 0.5, and median `rationale` 0.28 vs 0.70. The highest `restates` was 0.82, on comments such as `# Configure logging`, so `REDUNDANT` at 0.90 still never fired.
 - Other comments inside the context leaked into answers: with a neighbor's "why" comment in the code, a comment's `rationale` rose from 0.11 to 0.71. The tool now strips comments from the context code.
 
 ## Open questions
@@ -185,7 +200,7 @@ crates/agent-sap/src/cli.rs:39-41       HISTORY     0.91
 - Context for a comment at the top of a function body that describes the whole function (`// Returns true if …`). Sending only the next statement hides the code it describes: on the demo, `inconsistent` was 0.20 with the next statement and 0.73–0.75 with the whole body (comments stripped). Whether sending the whole body helps overall should be measured on the labeled set.
 
 - Doc-comment policy for v2: which questions apply to `///`/`//!`, and with what thresholds.
-- Other languages later? Tree-sitter makes the extractor portable; the questions are language-neutral.
+- More languages? Python was a small addition (a grammar, directives, a code-evidence table), so others should be too.
 
 Decided against: a sixth Jev question for "comment names something that doesn't exist." Jev can't tell "doesn't exist" from "not in the context we sent." If wanted, do it later as local symbol lookup.
 

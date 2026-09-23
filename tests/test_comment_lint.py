@@ -403,7 +403,7 @@ def test_csv_and_evaluate(tmp_path, api_key, capsys):
     fake = FakeJev({"Loop over": {"restates": 0.97}, "count the ids": {"restates": 0.95}})
     out_csv = tmp_path / "dump.csv"
     run_cli(["--no-cache", "--csv", str(out_csv), str(FIXTURE)], fake, capsys)
-    assert out_csv.read_text().splitlines()[0].endswith(",flags,label")
+    assert out_csv.read_text().splitlines()[0].startswith("file,start_line,end_line,label,comment,code_before")
     recs = list(csv.DictReader(out_csv.open()))
     assert len(recs) == 5  # every Jev-judged comment, none of the local ones
 
@@ -498,7 +498,7 @@ def test_large_commented_out_function_is_detected(tmp_path):
 def test_overlapping_paths_are_read_once(tmp_path):
     f = tmp_path / "a.rs"
     f.write_text("fn f() {}\n")
-    assert cl.find_rust_files([str(tmp_path), str(f)]) == [f.resolve()]
+    assert cl.find_source_files([str(tmp_path), str(f)]) == [f.resolve()]
 
 
 def test_cost_falls_back_to_token_count(tmp_path, api_key, capsys):
@@ -593,3 +593,132 @@ def test_trailing_comment_on_match_arm(tmp_path):
     src = "fn f() {\n    match m {\n        None => (), // walk up\n        a => return a,\n    }\n}\n"
     [c] = extract_src(tmp_path, src)
     assert c.code_after == "None => (),"
+
+
+# --- Python ------------------------------------------------------------------
+
+
+def extract_py(tmp_path: Path, src: str) -> list[cl.Comment]:
+    f = tmp_path / "x.py"
+    f.write_text(src)
+    return cl.extract(f, "x.py")
+
+
+def test_python_comments_and_context(tmp_path):
+    src = (
+        '"""Module docstring."""\n'
+        "import os  # stdlib\n"
+        "\n"
+        "class Client:\n"
+        "    def login(self, user: str) -> bool:\n"
+        '        """Docstring is not a comment."""\n'
+        "        session = self.load()\n"
+        "        # Test the connection first\n"
+        "        # before anything else\n"
+        "        if not session.ping():\n"
+        "            return False\n"
+        "        return True\n"
+    )
+    trailing, block = extract_py(tmp_path, src)
+    assert (trailing.lang, trailing.kind, trailing.trailing) == ("python", "line", True)
+    assert trailing.code_after == "import os"
+    assert (block.start_line, block.end_line) == (8, 9)
+    assert block.text == "# Test the connection first\n# before anything else"
+    assert block.item == "def login(self, user: str) -> bool:"
+    assert block.code_before == "session = self.load()"
+    assert block.code_after == "if not session.ping():\n    return False"
+
+
+def test_python_comment_in_arguments_gets_its_line(tmp_path):
+    src = "def f():\n    y = g(x,  # the retry count\n          2)\n"
+    [c] = extract_py(tmp_path, src)
+    assert c.code_after == "y = g(x,"
+
+
+def test_python_class_is_the_item_outside_methods(tmp_path):
+    src = "class Config:\n    # Seconds to wait\n    timeout = 30\n"
+    [c] = extract_py(tmp_path, src)
+    assert c.item == "class Config:"
+    assert c.code_after == "timeout = 30"
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "x = foo(1)",
+        "import os",
+        "from a.b import c",
+        "print(result)",
+        "self.retry(3)",
+        "def f():\n    return 1",
+        "    count += 1",
+        "items = [x for x in y]",
+    ],
+)
+def test_python_commented_code_detected(text):
+    assert cl.looks_like_code(text, cl.PYTHON)
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Note: important",  # parses as an annotated name
+        "Initialize (optional)",  # parses as a call
+        "return result",
+        "print hello",  # Python 2 print statement
+        "Try fresh login",
+        "Step 2: List tools",
+        "mcp < 2.0",
+        '{"retries": 3}',  # an example value
+        "Initialize",
+    ],
+)
+def test_python_prose_not_detected_as_code(text):
+    assert not cl.looks_like_code(text, cl.PYTHON)
+
+
+def py(text: str, **kw) -> cl.Comment:
+    c = cl.Comment(file="x.py", start_line=1, end_line=1, kind="line", text=text, trailing=False, lang="python", **kw)
+    cl.local_check(c)
+    return c
+
+
+def test_python_local_checks():
+    for directive in [
+        "#!/usr/bin/env python3",
+        "# -*- coding: utf-8 -*-",
+        "# noqa: E402",
+        "# type: ignore[attr-defined]",
+        "# pragma: no cover",
+        "# fmt: off",
+        "# ruff: noqa: E402 (imports must come after sys.path modification)",
+    ]:
+        assert py(directive).status == "skipped", directive
+    assert py("# TODO: retry on 503").status == "todo"
+    assert py("# x = compute()").status == "commented_code"
+    assert py("# Test the connection first").status == ""
+    # Rust directives don't apply to Python.
+    assert py("# SAFETY: fine").status == ""
+
+
+def test_calls_need_a_tight_paren_in_rust_too():
+    assert not cl.looks_like_code("Initialize (optional)")
+    assert cl.looks_like_code("initialize(true);")
+
+
+def test_finds_rust_and_python_but_skips_vendored_and_unknown(tmp_path, capsys):
+    (tmp_path / "a.rs").write_text("")
+    (tmp_path / "b.py").write_text("")
+    (tmp_path / "vendor").mkdir()
+    (tmp_path / "vendor" / "c.py").write_text("")
+    (tmp_path / "notes.txt").write_text("")
+    found = cl.find_source_files([str(tmp_path), str(tmp_path / "notes.txt")])
+    assert [f.name for f in found] == ["a.rs", "b.py"]
+    assert "skipping" in capsys.readouterr().err
+
+
+def test_line_context_drops_other_trailing_comments(tmp_path):
+    src = 'rows = [\n    {"amount": 100.0},  # Income\n    {"amount": -50.0},  # Expense\n]\n'
+    _, c = extract_py(tmp_path, src)
+    assert c.code_before == '{"amount": 100.0},'
+    assert c.code_after == '{"amount": -50.0},'

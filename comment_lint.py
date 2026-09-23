@@ -4,10 +4,11 @@
 # dependencies = [
 #     "httpx==0.28.1",
 #     "tree-sitter==0.25.2",
+#     "tree-sitter-python==0.25.0",
 #     "tree-sitter-rust==0.24.0",
 # ]
 # ///
-"""comment-lint: flag low-value or stale-prone Rust comments.
+"""comment-lint: flag low-value or stale-prone comments in Rust and Python.
 
 Pipeline: tree-sitter extracts comment blocks and the code around them, cheap
 local checks handle TODOs, directives and commented-out code, Jev (via
@@ -30,6 +31,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 import httpx
+import tree_sitter_python
 import tree_sitter_rust
 from tree_sitter import Language, Node, Parser
 
@@ -126,9 +128,79 @@ PRECEDING_MAX_CHARS = 800
 MACRO_CONTEXT_LINES = 15
 
 DEFAULT_CACHE = ".comment-lint-cache.json"
-SKIP_DIRS = {"target", "node_modules"}
+# Build output, dependencies, and copies of other projects' code.
+SKIP_DIRS = {"target", "node_modules", "__pycache__", "venv", "site-packages", "vendor", "third_party"}
 
-RUST = Language(tree_sitter_rust.language())
+# --- Languages ---------------------------------------------------------------
+
+# Directives every language shares: editor regions and spell-checker settings.
+_COMMON_DIRECTIVES = r"|#?region:|#region\b|#?endregion\b|(cspell|spell-checker|codespell):"
+
+
+@dataclass(frozen=True)
+class Lang:
+    name: str
+    language: Language
+    # Matched against every line: one directive line exempts the whole block.
+    directive_re: re.Pattern[str]
+    # Containers a comment's text is wrapped in to test whether it parses as code.
+    code_wrappers: tuple[tuple[str, str], ...]
+    # Tokens that count as evidence of code, and the stricter set used for one
+    # paragraph of a mixed prose/code block.
+    code_tokens: frozenset[str]
+    statement_tokens: frozenset[str]
+
+
+RUST = Lang(
+    name="rust",
+    language=Language(tree_sitter_rust.language()),
+    directive_re=re.compile(
+        r"^\s*("
+        r"(?i:safety):"  # unsafe justification; keep, never flag
+        r"|rustfmt::|rustfmt-"
+        r"|clippy::"
+        r"|@"  # `@generated`, rustc `//@` test directives
+        r"|~"  # rustc UI-test annotations (`//~ ERROR`)
+        r"|ignore-tidy"
+        r"|(compile-flags|edition|revisions):"
+        r"|(check|build|run)-pass\b" + _COMMON_DIRECTIVES + r")",
+        re.MULTILINE,
+    ),
+    code_wrappers=(
+        ("fn _x() {\n", "\n}"),  # statements
+        ("", ""),  # items
+        ("impl _X {\n", "\n}"),  # methods
+        ("struct _X {\n", "\n}"),  # fields
+        ("fn _x() { match _x {\n", "\n} }"),  # match arms
+    ),
+    # Comparison, logic and arithmetic operators are left out: invariant notes
+    # such as `// len <= cap` or `// well-known` parse cleanly but are prose.
+    code_tokens=frozenset({";", "=", "::", "->", "=>", "{", "}", "+=", "-=", "*=", "/="}),
+    # So that an example value such as `// [Ok(1), Err(Elapsed)]` doesn't count.
+    statement_tokens=frozenset({";", "{", "}"}),
+)
+
+PYTHON = Lang(
+    name="python",
+    language=Language(tree_sitter_python.language()),
+    directive_re=re.compile(
+        r"^\s*("
+        r"!"  # shebang
+        r"|.*-\*-|.*coding[:=]"  # encoding declarations and editor modelines
+        r"|noqa\b|nosec\b"
+        r"|(type|ruff|mypy|pyright|pylint|flake8|isort|pragma|fmt):"
+        r"|@generated" + _COMMON_DIRECTIVES + r")",
+        re.MULTILINE,
+    ),
+    # The text is dedented first, so statements and definitions parse as a module.
+    code_wrappers=(("", ""),),
+    # Braces are left out: in Python they're data (`{"a": 1}`), not blocks.
+    code_tokens=frozenset({";", "=", "->", ":=", "+=", "-=", "*=", "/="}),
+    statement_tokens=frozenset({";", "="}),
+)
+
+LANGS = {lang.name: lang for lang in (RUST, PYTHON)}
+LANGS_BY_SUFFIX = {".rs": RUST, ".py": PYTHON}
 
 # --- Extraction --------------------------------------------------------------
 
@@ -141,6 +213,7 @@ class Comment:
     kind: str  # "line" or "block"
     text: str
     trailing: bool
+    lang: str = "rust"
     item: str = ""
     code_before: str = ""
     code_after: str = ""
@@ -171,8 +244,12 @@ def is_doc_comment(node: Node) -> bool:
     return any(c.type in ("outer_doc_comment_marker", "inner_doc_comment_marker") for c in node.children)
 
 
+# Rust has `line_comment` and `block_comment`; Python has `comment`.
+COMMENT_TYPES = {"line_comment", "block_comment", "comment"}
+
+
 def is_comment(node: Node) -> bool:
-    return node.type in ("line_comment", "block_comment")
+    return node.type in COMMENT_TYPES
 
 
 def node_text(node: Node) -> str:
@@ -204,8 +281,8 @@ def group_line_comments(nodes: list[Node], src: bytes) -> list[list[Node]]:
         prev = groups[-1][-1] if groups else None
         if (
             prev is not None
-            and node.type == "line_comment"
-            and prev.type == "line_comment"
+            and node.type != "block_comment"
+            and prev.type == node.type
             and standalone
             and line_prefix(src, prev).strip() == ""
             and node.start_point.row == prev.end_point.row + (0 if node_text(prev).endswith("\n") else 1)
@@ -218,20 +295,26 @@ def group_line_comments(nodes: list[Node], src: bytes) -> list[list[Node]]:
 
 
 def signature(node: Node) -> str:
+    # Stop at the body, or at a comment before it: in Python, a comment on the
+    # first line of a body sits between the `:` and the body.
+    stops = [c.start_byte for c in node.children if is_comment(c)]
     body = node.child_by_field_name("body")
-    end = body.start_byte if body is not None else node.end_byte
+    if body is not None:
+        stops.append(body.start_byte)
+    end = min(stops, default=node.end_byte)
     text = node.text[: end - node.start_byte].decode("utf-8", errors="replace")
     return " ".join(text.split())
 
 
-TYPE_TYPES = {"impl_item", "trait_item", "struct_item", "enum_item", "union_item", "mod_item"}
+FUNCTION_TYPES = {"function_item", "function_signature_item", "function_definition"}
+TYPE_TYPES = {"impl_item", "trait_item", "struct_item", "enum_item", "union_item", "mod_item", "class_definition"}
 
 
 def enclosing_item(node: Node) -> str:
     fallback = ""
     cur = node.parent
     while cur is not None:
-        if cur.type in ("function_item", "function_signature_item"):
+        if cur.type in FUNCTION_TYPES:
             return signature(cur)
         if cur.type in TYPE_TYPES and not fallback:
             fallback = signature(cur)
@@ -254,7 +337,7 @@ def next_code_sibling(node: Node) -> Node | None:
 
 
 def comment_body(raw: str, kind: str) -> str:
-    """Comment text with the `//` / `/* */` markers removed."""
+    """Comment text with the `//`, `#` or `/* */` markers removed."""
     if kind == "block":
         inner = raw[2:-2] if raw.endswith("*/") else raw[2:]
         lines = [re.sub(r"^\s*\*(?!/)\s?", "", ln).rstrip() for ln in inner.split("\n")]
@@ -262,8 +345,9 @@ def comment_body(raw: str, kind: str) -> str:
     out = []
     for ln in raw.split("\n"):
         ln = ln.strip()
-        if ln.startswith("//"):
-            ln = ln[2:]
+        marker = "//" if ln.startswith("//") else "#" if ln.startswith("#") else ""
+        if marker:
+            ln = ln[len(marker) :]
             if ln.startswith(" "):
                 ln = ln[1:]
         out.append(ln)
@@ -319,6 +403,8 @@ def following_code(src: bytes, node: Node) -> str:
 
 def is_code_line(line: str) -> bool:
     s = line.strip()
+    if s.startswith("#") and not s.startswith(("#[", "#![")):  # a Python comment, not a Rust attribute
+        return False
     return bool(s) and not s.startswith(("//", "/*", "*"))
 
 
@@ -335,7 +421,7 @@ def lines_after(lines: list[str], row: int) -> str:
 
 # Parents whose children are whole statements, items, arms or fields.
 STATEMENT_LISTS = {
-    "block", "declaration_list", "source_file", "match_block",
+    "block", "declaration_list", "source_file", "module", "match_block",
     "field_declaration_list", "field_initializer_list", "enum_variant_list",
 }
 
@@ -349,14 +435,18 @@ def line_without(src: bytes, first: Node, last: Node) -> str:
     return " ".join(text.decode("utf-8", errors="replace").split())
 
 
+# A trailing comment on a source line: `x = 1  # note`, `let x = 1; // note`.
+TRAILING_COMMENT_RE = re.compile(r"\s+(#|//)\s.*$")
+
+
 def line_before(lines: list[str], row: int) -> str:
     for line in reversed(lines[:row]):
         if is_code_line(line):
-            return line.strip()
+            return TRAILING_COMMENT_RE.sub("", line).strip()
     return ""
 
 
-def build_comment(path: str, group: list[Node], src: bytes) -> Comment:
+def build_comment(path: str, group: list[Node], src: bytes, lang: Lang = RUST) -> Comment:
     first, last = group[0], group[-1]
     trailing = line_prefix(src, first).strip() != ""
     text = "\n".join(node_text(n).rstrip("\n") for n in group)
@@ -365,9 +455,10 @@ def build_comment(path: str, group: list[Node], src: bytes) -> Comment:
         file=path,
         start_line=first.start_point.row + 1,
         end_line=end_row + 1,
-        kind="line" if first.type == "line_comment" else "block",
+        kind="block" if first.type == "block_comment" else "line",
         text=text,
         trailing=trailing,
+        lang=lang.name,
         item=enclosing_item(first),
     )
     if first.parent is not None and first.parent.type == "token_tree":
@@ -434,19 +525,24 @@ def fit_budget(c: Comment, budget: int = CONTEXT_BUDGET_CHARS) -> None:
 
 
 def extract(path: Path, display: str) -> list[Comment]:
+    lang = LANGS_BY_SUFFIX[path.suffix]
     src = path.read_bytes()
-    tree = Parser(RUST).parse(src)
+    tree = Parser(lang.language).parse(src)
+    # Python docstrings are strings, not comments, so they never get here.
     nodes = [n for n in collect_comments(tree.root_node) if not is_doc_comment(n)]
-    return [build_comment(display, g, src) for g in group_line_comments(nodes, src)]
+    return [build_comment(display, g, src, lang) for g in group_line_comments(nodes, src)]
 
 
-def find_rust_files(paths: list[str]) -> list[Path]:
+def find_source_files(paths: list[str]) -> list[Path]:
     files: dict[Path, None] = {}
     for p in map(Path, paths):
         if p.is_file():
-            files.setdefault(p.resolve())
+            if p.suffix in LANGS_BY_SUFFIX:
+                files.setdefault(p.resolve())
+            else:
+                print(f"comment-lint: skipping {p}: only {', '.join(LANGS_BY_SUFFIX)} files are checked", file=sys.stderr)
             continue
-        for f in sorted(p.rglob("*.rs")):
+        for f in sorted(x for x in p.rglob("*") if x.suffix in LANGS_BY_SUFFIX and x.is_file()):
             rel = f.relative_to(p).parts[:-1]
             if any(part in SKIP_DIRS or part.startswith(".") for part in rel):
                 continue
@@ -466,48 +562,30 @@ def display_path(p: Path) -> str:
 # Upper case anywhere; any case only at the start of a line ("the todo list" is prose).
 TODO_RE = re.compile(r"\b(TODO|FIXME)\b|^\s*(?i:todo|fixme)\b", re.MULTILINE)
 LICENSE_RE = re.compile(r"SPDX-License-Identifier|\bcopyright\b|licensed under|\blicense\b", re.IGNORECASE)
-# Matched against every line: one directive line exempts the whole block.
-DIRECTIVE_RE = re.compile(
-    r"^\s*("
-    r"(?i:safety):"  # unsafe justification; keep, never flag
-    r"|rustfmt::|rustfmt-"
-    r"|clippy::"
-    r"|@"  # `@generated`, rustc `//@` test directives
-    r"|~"  # rustc UI-test annotations (`//~ ERROR`)
-    r"|ignore-tidy"
-    r"|(compile-flags|edition|revisions):"
-    r"|(check|build|run)-pass\b"
-    r"|#?region:|#region\b|#?endregion\b"
-    r"|(cspell|spell-checker|codespell):"
-    r")",
-    re.MULTILINE,
-)
-
 # Evidence that a clean parse is really code and not a short English phrase.
-# Comparison, logic and arithmetic operators are left out: invariant notes such
-# as `// len <= cap` or `// well-known` parse cleanly but are prose.
-CODE_TOKENS = {";", "=", "::", "->", "=>", "{", "}", "+=", "-=", "*=", "/="}
-# Stricter evidence for one paragraph of a mixed prose/code block, so that an
-# example value such as `// [Ok(1), Err(Elapsed)]` doesn't count.
-STATEMENT_TOKENS = {";", "{", "}"}
+# Node names don't collide between the grammars, so one set serves both.
 STATEMENT_NODES = {
+    # Rust
     "let_declaration", "function_item", "struct_item", "enum_item", "impl_item", "trait_item",
     "use_declaration", "mod_item", "const_item", "static_item", "type_item",
+    # Python
+    "import_statement", "import_from_statement", "function_definition", "class_definition",
 }
+# Literals are left out: they turn labels such as `# mcp < 2.0` or
+# `// capacity >= 9` into "code", and real commented-out code nearly always
+# has stronger evidence (`=`, a call, `;`, a declaration).
 CODE_NODES = STATEMENT_NODES | {
-    "string_literal", "raw_string_literal", "char_literal", "integer_literal", "float_literal",
+    # Rust
     "call_expression", "macro_invocation", "scoped_identifier", "scoped_type_identifier",
     "if_expression", "match_expression", "for_expression", "while_expression", "loop_expression",
     "assignment_expression", "compound_assignment_expr", "reference_expression",
     "generic_type", "reference_type", "visibility_modifier",
+    # Python
+    "call", "augmented_assignment", "subscript",
+    "if_statement", "for_statement", "while_statement", "with_statement", "try_statement",
+    "list_comprehension", "dictionary_comprehension", "set_comprehension", "generator_expression",
 }
-CODE_WRAPPERS = [
-    ("fn _x() {\n", "\n}"),  # statements
-    ("", ""),  # items
-    ("impl _X {\n", "\n}"),  # methods
-    ("struct _X {\n", "\n}"),  # fields
-    ("fn _x() { match _x {\n", "\n} }"),  # match arms
-]
+CALL_NODES = {"call_expression", "call"}
 
 
 def has_bad_node(node: Node) -> bool:
@@ -516,11 +594,19 @@ def has_bad_node(node: Node) -> bool:
     return any(has_bad_node(c) for c in node.children)
 
 
+def tight_call(node: Node) -> bool:
+    """True if `(` directly follows the callee, as in code: `f(x)`, not `f (x)`."""
+    func, args = node.child_by_field_name("function"), node.child_by_field_name("arguments")
+    return func is not None and args is not None and func.end_byte == args.start_byte
+
+
 def has_code_evidence(node: Node, lo: int, hi: int, nodes: set[str], tokens: set[str]) -> bool:
     if node.end_byte <= lo or node.start_byte >= hi:
         return False
     if node.start_byte >= lo and node.end_byte <= hi:
-        if node.type in nodes or (not node.is_named and node.type in tokens):
+        if node.type in CALL_NODES and not tight_call(node):
+            pass  # `Initialize (optional)` parses as a call, but it's prose
+        elif node.type in nodes or (not node.is_named and node.type in tokens):
             return True
     return any(has_code_evidence(c, lo, hi, nodes, tokens) for c in node.children)
 
@@ -529,40 +615,44 @@ def has_code_evidence(node: Node, lo: int, hi: int, nodes: set[str], tokens: set
 LONE_LITERAL_RE = re.compile(r"""^\s*(-?[\d.][\w.]*|"[^"\n]*"|'.')\s*$""")
 
 
-def looks_like_code(text: str, strict: bool = False) -> bool:
+def looks_like_code(text: str, lang: Lang = RUST, strict: bool = False) -> bool:
+    text = textwrap.dedent(text).strip("\n")
     if not text.strip() or LONE_LITERAL_RE.match(text):
         return False
-    parser = Parser(RUST)
-    for head, tail in CODE_WRAPPERS:
+    parser = Parser(lang.language)
+    for head, tail in lang.code_wrappers:
         src = (head + text + tail).encode()
         root = parser.parse(src).root_node
         if has_bad_node(root):
             continue
         lo, hi = len(head.encode()), len(head.encode()) + len(text.encode())
-        nodes, tokens = (STATEMENT_NODES, STATEMENT_TOKENS) if strict else (CODE_NODES, CODE_TOKENS)
+        nodes, tokens = (STATEMENT_NODES, lang.statement_tokens) if strict else (CODE_NODES, lang.code_tokens)
         if has_code_evidence(root, lo, hi, nodes, tokens):
             return True
     return False
 
 
-def contains_code(body: str) -> bool:
+def contains_code(body: str, lang: Lang = RUST) -> bool:
     """True if the block, or any blank-line-separated paragraph of it, is code."""
     paragraphs = re.split(r"\n\s*\n", body)
-    return looks_like_code(body) or (len(paragraphs) > 1 and any(looks_like_code(p, strict=True) for p in paragraphs))
+    if looks_like_code(body, lang):
+        return True
+    return len(paragraphs) > 1 and any(looks_like_code(p, lang, strict=True) for p in paragraphs)
 
 
 def local_check(c: Comment) -> None:
     """Set status for comments that need no API call."""
+    lang = LANGS[c.lang]
     body = comment_body(c.text, c.kind)
     if not re.search(r"\w", body):
         c.status = "skipped"  # empty or decorative (`// -----`)
-    elif DIRECTIVE_RE.search(body):
+    elif lang.directive_re.search(body):
         c.status = "skipped"
     elif LICENSE_RE.search(body) and not c.item and not c.code_before:
         c.status = "skipped"  # header boilerplate: before any code in the file
     elif TODO_RE.search(body):
         c.status = "todo"
-    elif contains_code(body):
+    elif contains_code(body, lang):
         c.status = "commented_code"
         c.flags = [("COMMENTED_CODE", None)]
 
@@ -794,6 +884,7 @@ def text_report(comments: list[Comment], show_all: bool) -> str:
 def json_record(c: Comment) -> dict:
     return {
         "file": c.file,
+        "language": c.lang,
         "start_line": c.start_line,
         "end_line": c.end_line,
         "kind": c.kind,
@@ -814,7 +905,11 @@ def json_report(comments: list[Comment], show_all: bool) -> str:
     return json.dumps({"records": [json_record(c) for c in chosen], "summary": summary(comments)}, indent=2)
 
 
-CSV_FIELDS = ["file", "start_line", "end_line", "kind", "trailing", "comment", *QUESTION_NAMES, "flags", "label"]
+# `label` sits next to the comment and its code, so labeling reads left to right.
+CSV_FIELDS = [
+    "file", "start_line", "end_line", "label", "comment", "code_before", "code_after", "item",
+    "language", "kind", "trailing", "flags", *QUESTION_NAMES,
+]
 
 
 def write_csv(path: Path, comments: list[Comment]) -> None:
@@ -825,10 +920,11 @@ def write_csv(path: Path, comments: list[Comment]) -> None:
             if not c.probs:
                 continue
             w.writerow({
-                "file": c.file, "start_line": c.start_line, "end_line": c.end_line,
-                "kind": c.kind, "trailing": c.trailing, "comment": c.text,
+                "file": c.file, "start_line": c.start_line, "end_line": c.end_line, "label": "",
+                "comment": c.text, "code_before": c.code_before, "code_after": c.code_after, "item": c.item,
+                "language": c.lang, "kind": c.kind, "trailing": c.trailing,
+                "flags": " ".join(cat for cat, _ in c.flags),
                 **{k: f"{c.probs[k]:.4f}" for k in QUESTION_NAMES},
-                "flags": " ".join(cat for cat, _ in c.flags), "label": "",
             })
 
 
@@ -918,8 +1014,8 @@ async def probe(api_key: str, transport: httpx.AsyncBaseTransport | None = None)
 
 
 def parse_args(argv: list[str] | None) -> argparse.Namespace:
-    ap = argparse.ArgumentParser(prog="comment-lint", description="Flag low-value or stale-prone Rust comments.")
-    ap.add_argument("paths", nargs="*", default=["."], help="Rust files or directories (default: .)")
+    ap = argparse.ArgumentParser(prog="comment-lint", description="Flag low-value or stale-prone code comments.")
+    ap.add_argument("paths", nargs="*", default=["."], help="Rust or Python files, or directories (default: .)")
     ap.add_argument("--json", action="store_true", help="print full records for flagged comments")
     ap.add_argument("--all", action="store_true", help="include unflagged comments with their probabilities")
     ap.add_argument("--csv", metavar="PATH", help="write every judged comment with its probabilities (for labeling)")
@@ -946,7 +1042,7 @@ def run(argv: list[str] | None = None, transport: httpx.AsyncBaseTransport | Non
         return asyncio.run(probe(api_key, transport=transport))
 
     comments: list[Comment] = []
-    for f in find_rust_files(args.paths):
+    for f in find_source_files(args.paths):
         comments.extend(extract(f, display_path(f)))
     for c in comments:
         local_check(c)
