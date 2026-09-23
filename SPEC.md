@@ -55,6 +55,7 @@ Jev is the screen, not the editor. It sees every comment; Claude sees only the f
 - Endpoint: `POST https://openrouter.ai/api/alpha/decisions`
 - Auth: `Authorization: Bearer $OPENROUTER_API_KEY`
 - Model: **pin `typesafe/jev-1.13`**, not `~typesafe/jev-latest`. Thresholds are tuned against one version; the alias would silently shift them. Re-calibrate on purpose when upgrading.
+  - *Found in live testing:* `typesafe/jev-1.13` is itself an alias. Responses name a dated build (`typesafe/jev-1.13-20260917`), and the API accepts that name directly. The tool pins the dated build.
 - `state` accepts a string or a JSON object. Send an object:
 
 ```json
@@ -171,7 +172,17 @@ crates/agent-sap/src/cli.rs:39-41       HISTORY     0.91
 - The OpenRouter Python SDK has an `Alpha.Decisions` call, but plain HTTP is simpler and has fewer dependencies.
 - Network: from the SLB network, `docs.typesafe.ai` gets a firewall warning page (category "AI-platform-service"); `openrouter.ai` loads normally. Another reason to build elsewhere.
 
+## Findings from the first live runs
+
+- The request and response shapes match the docs exactly. Requests were served by provider `TypeSafe`. Cost is $0.042 per million input tokens; output tokens are free.
+- About 850 input tokens per comment on average. 245 ripgrep comments took 23 s, cost $0.0088, with no errors.
+- Identical requests vary slightly (for example `restates` 0.62 / 0.63 / 0.65).
+- Scores run lower than the §3 starting thresholds assume. Across 245 ripgrep comments the highest `restates` was 0.85, and an obviously redundant demo comment scored 0.62–0.66, so `REDUNDANT` at 0.90 almost never fires. Calibration (§4) should settle this.
+- Other comments inside the context leaked into answers: with a neighbor's "why" comment in the code, a comment's `rationale` rose from 0.11 to 0.71. The tool now strips comments from the context code.
+
 ## Open questions
+
+- Context for a comment at the top of a function body that describes the whole function (`// Returns true if …`). Sending only the next statement hides the code it describes: on the demo, `inconsistent` was 0.20 with the next statement and 0.73–0.75 with the whole body (comments stripped). Whether sending the whole body helps overall should be measured on the labeled set.
 
 - Doc-comment policy for v2: which questions apply to `///`/`//!`, and with what thresholds.
 - Other languages later? Tree-sitter makes the extractor portable; the questions are language-neutral.

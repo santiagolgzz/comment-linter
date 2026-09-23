@@ -12,23 +12,21 @@ AI coding agents write a lot of comments. Many of them say what the next line al
 ```
 $ uv run comment_lint.py examples/demo.rs
 
-examples/demo.rs:12   REDUNDANT        0.96
-examples/demo.rs:17   HISTORY          0.93
-examples/demo.rs:22   STALE            0.84
+examples/demo.rs:17   HISTORY          0.91
 examples/demo.rs:28   COMMENTED_CODE   -
 
 examples/demo.rs:33   TODO   TODO: cache this if inventories get large
 --
-4 flagged / 6 checked · 1 TODOs · cost $0.0001
+2 flagged / 6 checked · 1 TODOs · cost $0.0001
 ```
 
 - **It only reports.** It never changes your code.
-- **It's cheap.** Roughly 3 cents per 1,000 comments.
+- **It's cheap.** About 4 cents per 1,000 comments.
 - **It's quiet by design.** It only flags a comment when it's fairly sure, and it leaves comments that explain *why* alone.
 - **It's one file.** Nothing to install beyond [uv](https://docs.astral.sh/uv/).
 
 > [!NOTE]
-> This is an early version. The thresholds that decide what gets flagged are starting guesses, not yet tuned on real labeled comments. Treat the output as suggestions. The scores in the example above are illustrative. You can [help tune them](#tuning-the-thresholds).
+> This is an early version. The thresholds that decide what gets flagged are starting guesses, not yet tuned on real labeled comments. For now they're too strict for some flags: in the example above, `// Create a new empty HashMap` scores 0.66 for "only repeats the code", below the 0.90 needed for `REDUNDANT`. The demo's `STALE` example isn't caught yet either, because the tool sends only the next statement, not the whole function the comment describes. Treat the output as suggestions, and [help tune the thresholds](#tuning-the-thresholds).
 
 ## Contents
 
@@ -57,7 +55,7 @@ Comments that explain a reason, a rule, or a tradeoff are kept, such as `// Satu
 
 `TODO` and `FIXME` comments are listed separately, without judgment.
 
-All of these examples are in [`examples/demo.rs`](examples/demo.rs).
+Apart from the `FRAGILE` one, these examples come from [`examples/demo.rs`](examples/demo.rs).
 
 ## Quick start
 
@@ -156,20 +154,20 @@ Pass a folder to check every `.rs` file inside it (`target/` and hidden folders 
 ## Reading the results
 
 ```
-examples/demo.rs:12   REDUNDANT        0.96
+examples/demo.rs:17   HISTORY          0.91
 ```
 
-- **`examples/demo.rs:12`** is where the comment is. A range such as `:81-82` means the comment spans several lines.
-- **`REDUNDANT`** is what's wrong with it (see [What it finds](#what-it-finds)).
-- **`0.96`** is how sure the model is, from 0 to 1. Local checks such as `COMMENTED_CODE` show `-`, because no model was involved.
+- **`examples/demo.rs:17`** is where the comment is. A range such as `:81-82` means the comment spans several lines.
+- **`HISTORY`** is what's wrong with it (see [What it finds](#what-it-finds)).
+- **`0.91`** is how sure the model is, from 0 to 1. Local checks such as `COMMENTED_CODE` show `-`, because no model was involved.
 
 The last line sums up the run:
 
 ```
-4 flagged / 6 checked · 1 TODOs · cost $0.0001
+2 flagged / 6 checked · 1 TODOs · cost $0.0001
 ```
 
-4 comments were flagged out of 6 checked. There's 1 TODO, and the run cost $0.0001. A cost that starts with `~` is an estimate.
+2 comments were flagged out of 6 checked. There's 1 TODO, and the run cost $0.0001. A cost that starts with `~` is an estimate.
 
 ### What to do with a flag
 
@@ -312,7 +310,7 @@ The full design, and the reasoning behind each choice, is in [SPEC.md](SPEC.md).
 
 **Where it goes.** To OpenRouter, which passes it on to TypeSafe, the company that runs Jev. Every request tells OpenRouter to use only providers that neither store your data nor train on it. If no such provider is available, the request fails rather than going anywhere else.
 
-**What it costs.** Jev charges about $0.042 per million input tokens, and a typical comment with its context is around 600 tokens. That's roughly 3 cents per 1,000 comments. Each run shows its total on the last line.
+**What it costs.** Jev charges about $0.042 per million input tokens, and a typical comment with its context and the five questions comes to about 850 tokens. In a test on 245 comments from ripgrep, that worked out to about 4 cents per 1,000 comments, and took 23 seconds. Each run shows its total on the last line.
 
 ## Troubleshooting
 

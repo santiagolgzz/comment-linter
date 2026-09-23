@@ -232,7 +232,7 @@ def test_request_shape(tmp_path, api_key, capsys):
     fake = FakeJev({})
     code, _ = run_cli(["--no-cache", str(FIXTURE)], fake, capsys)
     body = fake.bodies[0]
-    assert body["model"] == "typesafe/jev-1.13"
+    assert body["model"] == cl.MODEL == "typesafe/jev-1.13-20260917"
     assert body["provider"] == {"zdr": True, "data_collection": "deny"}
     assert set(body["questions"]) == {"restates", "rationale", "inconsistent", "history", "fragile"}
     assert all(q["type"] == "noul" for q in body["questions"].values())
@@ -528,7 +528,7 @@ def test_out_of_range_probability_is_an_error(tmp_path, api_key, capsys, bad):
 def test_probe_prints_raw_and_decoded(api_key, capsys):
     code, out = run_cli(["--probe"], FakeJev({"Loop over": {"restates": 0.97}}), capsys)
     assert code == 0
-    assert '"model": "typesafe/jev-1.13"' in out
+    assert f'"model": "{cl.MODEL}"' in out
     assert "== response: HTTP 200 ==" in out
     assert "restates=0.97" in out
     assert "flags: REDUNDANT 0.97" in out
@@ -554,3 +554,42 @@ def test_demo_matches_readme(monkeypatch, capsys):
         "1 flagged / 1 checked · 1 TODOs · cost $0.0000\n"
         "5 comments would be sent to Jev\n"
     )
+
+
+def test_other_comments_are_left_out_of_context(tmp_path):
+    src = (
+        "fn f() {\n"
+        "    let a = 1; // why a is 1\n"
+        "    // the comment under test\n"
+        "    if a > 0 {\n"
+        "        // Saturate: callers expect it.\n"
+        "        g(a); /* inline */ h();\n"
+        "        /// doc on a nested item\n"
+        "        fn inner() {}\n"
+        "    }\n"
+        "}\n"
+    )
+    c = next(c for c in extract_src(tmp_path, src) if "under test" in c.text)
+    assert c.code_before == "let a = 1;"
+    assert c.code_after == "if a > 0 {\n    g(a);  h();\n    fn inner() {}\n}"
+
+
+def test_inline_comment_in_arguments_gets_its_line(tmp_path):
+    src = (
+        "fn f() {\n"
+        "    let parent = p();\n"
+        "    match self.matched(parent, /* is_dir */ true) {\n"
+        "        _ => (),\n"
+        "    }\n"
+        "}\n"
+    )
+    [c] = extract_src(tmp_path, src)
+    assert c.trailing
+    assert c.code_after == "match self.matched(parent, true) {"
+    assert c.code_before == "let parent = p();"
+
+
+def test_trailing_comment_on_match_arm(tmp_path):
+    src = "fn f() {\n    match m {\n        None => (), // walk up\n        a => return a,\n    }\n}\n"
+    [c] = extract_src(tmp_path, src)
+    assert c.code_after == "None => (),"

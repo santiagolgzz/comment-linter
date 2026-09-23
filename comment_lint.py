@@ -37,8 +37,9 @@ from tree_sitter import Language, Node, Parser
 
 API_URL = "https://openrouter.ai/api/alpha/decisions"
 # Pinned on purpose: thresholds are tuned against one version. Re-calibrate
-# before changing it.
-MODEL = "typesafe/jev-1.13"
+# before changing it. `typesafe/jev-1.13` is itself an alias that resolves to
+# a dated build, so pin the build.
+MODEL = "typesafe/jev-1.13-20260917"
 PROVIDER = {"zdr": True, "data_collection": "deny"}
 
 QUESTIONS = {
@@ -269,12 +270,40 @@ def comment_body(raw: str, kind: str) -> str:
     return "\n".join(out)
 
 
+def comment_spans(node: Node, end: Node) -> list[tuple[int, int]]:
+    """Byte ranges of every comment from `node` through its sibling `end`."""
+    spans = []
+    cur: Node | None = node
+    while cur is not None:
+        for c in collect_comments(cur):
+            # Doc comments include their newline; keep it so lines stay apart.
+            spans.append((c.start_byte, c.end_byte - (1 if c.text.endswith(b"\n") else 0)))
+        if cur == end:
+            break
+        cur = cur.next_sibling
+    return sorted(spans)
+
+
 def code_text(src: bytes, node: Node | None, end: Node | None = None) -> str:
-    """Source from `node` through `end`, dedented as if it started at column 0."""
+    """Source from `node` through `end`, without comments, dedented to column 0.
+
+    Other comments are left out: the questions are about one comment, and a
+    neighbor's reasoning would leak into its answers.
+    """
     if node is None:
         return ""
-    text = src[node.start_byte : (end or node).end_byte].decode("utf-8", errors="replace")
-    return textwrap.dedent(" " * node.start_point.column + text).strip()
+    end = end or node
+    out, pos = bytearray(), node.start_byte
+    for start, stop in comment_spans(node, end):
+        out += src[pos:start] + b"\0"
+        pos = stop
+    out += src[pos : end.end_byte]
+    lines = []
+    for line in out.decode("utf-8", errors="replace").split("\n"):
+        if "\0" in line and not line.replace("\0", "").strip():
+            continue  # the line held only a comment
+        lines.append(line.replace("\0", "").rstrip())
+    return textwrap.dedent(" " * node.start_point.column + "\n".join(lines)).strip()
 
 
 def following_code(src: bytes, node: Node) -> str:
@@ -299,8 +328,25 @@ def lines_after(lines: list[str], row: int) -> str:
     for line in lines[row + 1 : row + 1 + MACRO_CONTEXT_LINES]:
         if not line.strip():
             break
-        out.append(line)
+        if is_code_line(line):
+            out.append(line)
     return textwrap.dedent("\n".join(out)).strip()
+
+
+# Parents whose children are whole statements, items, arms or fields.
+STATEMENT_LISTS = {
+    "block", "declaration_list", "source_file", "match_block",
+    "field_declaration_list", "field_initializer_list", "enum_variant_list",
+}
+
+
+def line_without(src: bytes, first: Node, last: Node) -> str:
+    """The source line a comment sits on, with the comment cut out."""
+    start = src.rfind(b"\n", 0, first.start_byte) + 1
+    end = src.find(b"\n", last.end_byte)
+    end = len(src) if end < 0 else end
+    text = src[start : first.start_byte] + src[last.end_byte : end]
+    return " ".join(text.decode("utf-8", errors="replace").split())
 
 
 def line_before(lines: list[str], row: int) -> str:
@@ -334,15 +380,25 @@ def build_comment(path: str, group: list[Node], src: bytes) -> Comment:
             c.code_after = lines_after(lines, end_row)
         c.code_before = line_before(lines, first.start_point.row)
     elif trailing:
-        # The comment describes the code it trails: the statement ending on
-        # this line if there is one, otherwise the line itself.
+        # A comment after a whole statement describes that statement. One
+        # inside an expression (`f(a, /* is_dir */ true)`) or followed by more
+        # code describes its line.
         target = prev_code_sibling(first)
-        if target is not None and target.end_point.row == first.start_point.row:
+        line_end = src.find(b"\n", last.end_byte)
+        inline = src[last.end_byte : line_end if line_end >= 0 else len(src)].strip() != b""
+        if (
+            not inline
+            and first.parent is not None
+            and first.parent.type in STATEMENT_LISTS
+            and target is not None
+            and target.end_point.row == first.start_point.row
+        ):
             c.code_after = code_text(src, target)
             c.code_before = code_text(src, prev_code_sibling(target))
         else:
-            c.code_after = line_prefix(src, first).strip()
-            c.code_before = code_text(src, prev_code_sibling(first))
+            lines = src.decode("utf-8", errors="replace").split("\n")
+            c.code_after = line_without(src, first, last)
+            c.code_before = line_before(lines, first.start_point.row)
     else:
         c.code_before = code_text(src, prev_code_sibling(first))
         c.code_after = following_code(src, last)
