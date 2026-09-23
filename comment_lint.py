@@ -44,45 +44,65 @@ API_URL = "https://openrouter.ai/api/alpha/decisions"
 MODEL = "typesafe/jev-1.13-20260917"
 PROVIDER = {"zdr": True, "data_collection": "deny"}
 
+# One question per way a comment can mislead the next agent (see SPEC.md,
+# "What a good comment is"), plus one for what makes a comment worth keeping.
 QUESTIONS = {
-    "restates": {
+    "stale": {
         "type": "noul",
-        "instructions": "Does the comment only restate what the code already makes obvious?",
+        "instructions": "Does the code shown contradict something the comment states?",
         "criteria": {
-            "true": "A competent reader learns nothing from the comment that the code does not already show.",
-            "false": "The comment adds information not evident from the code itself.",
-        },
-    },
-    "rationale": {
-        "type": "noul",
-        "instructions": "Does the comment explain a non-obvious reason, constraint, invariant, or tradeoff?",
-        "criteria": {
-            "true": "It explains why, or a rule the code must respect, that the code alone does not reveal.",
-            "false": "It describes what or how, or nothing beyond the code.",
-        },
-    },
-    "inconsistent": {
-        "type": "noul",
-        "instructions": "Does the comment make a claim that the code contradicts?",
-        "criteria": {
-            "true": "Something the comment states about behavior, names, values, or order does not match the code.",
-            "false": "Everything the comment claims is consistent with the code.",
+            "true": (
+                "A claim in the comment about behavior, names, values, order, or what calls or reads what "
+                "is contradicted by the code shown."
+            ),
+            "false": (
+                "Every claim the shown code can check agrees with it, or the code the comment talks about "
+                "is not shown. Claims about code that is not shown do not count."
+            ),
         },
     },
     "history": {
         "type": "noul",
-        "instructions": "Does the comment narrate a past change instead of describing the code as it is?",
+        "instructions": (
+            "Does the comment record how the code came to be, rather than a fact about the code as it is now?"
+        ),
         "criteria": {
-            "true": "It refers to what the code used to do, what was changed, fixed, or replaced, or to a past session or refactor.",
-            "false": "It describes the code in the present tense with no reference to its history.",
+            "true": (
+                "It tells the story of a change (what the code used to do; what was fixed, replaced, added or "
+                "refactored; 'now', 'previously', 'no longer'), or points to where a change was planned or "
+                "discussed: a design doc, proposal, plan, spec, issue, ticket, pull request, phase, milestone, "
+                "or past session."
+            ),
+            "false": (
+                "It states a fact about the code as it is now. Describing what the program or a test does to "
+                "data while it runs is not history."
+            ),
         },
     },
-    "fragile": {
+    "command": {
         "type": "noul",
-        "instructions": "Does the comment describe implementation details that are likely to change whenever the code changes?",
+        "instructions": "Does the comment give future editors an instruction without stating the fact behind it?",
         "criteria": {
-            "true": "It restates specific steps, counts, variable names, or mechanics that a routine edit would invalidate.",
-            "false": "It describes intent, contract, or reasons that survive routine edits.",
+            "true": (
+                "It says what must, must not, should or should never be done, or to keep something unchanged "
+                "or in sync, and does not say what would happen or break otherwise."
+            ),
+            "false": "It gives no instruction, or it states the consequence or fact that motivates the instruction.",
+        },
+    },
+    "nonlocal": {
+        "type": "noul",
+        "instructions": "Does the comment tell the reader a fact that the nearby code does not show?",
+        "criteria": {
+            "true": (
+                "It gives information a reader of only this code would miss: a dependency on code elsewhere, "
+                "an effect on or from other code or systems, the behavior of an external API or the runtime, "
+                "or why something that looks wrong is deliberate."
+            ),
+            "false": (
+                "It describes what the nearby code visibly does, labels a section or step, or says nothing a "
+                "reader of the code, including its function and test names, would not already know."
+            ),
         },
     },
 }
@@ -91,15 +111,13 @@ QUESTION_NAMES = list(QUESTIONS)
 # --- Rules (starting points; calibrate before trusting) ----------------------
 
 THRESHOLDS = {
-    "stale_inconsistent": 0.75,
-    "history": 0.80,
-    "redundant_restates": 0.90,
-    "redundant_max_rationale": 0.20,
-    "fragile": 0.85,
-    "fragile_max_rationale": 0.30,
-    # Above this, only STALE may fire: a wrong "why" is still wrong.
-    "rationale_veto": 0.70,
+    "stale": 0.75,  # flag STALE above this
+    "history": 0.80,  # flag HISTORY above this
+    "command": 0.80,  # flag COMMAND above this
+    "nonlocal": 0.20,  # flag WHAT_ONLY below this
 }
+# Label names used in a labeled CSV, and the flag that should catch each.
+LABEL_FLAGS = {"stale": "STALE", "history": "HISTORY", "command": "COMMAND", "what": "WHAT_ONLY"}
 
 # --- Runtime limits ----------------------------------------------------------
 
@@ -401,6 +419,35 @@ def following_code(src: bytes, node: Node) -> str:
     return code_text(src, first, last)
 
 
+def is_docstring(node: Node | None) -> bool:
+    return (
+        node is not None
+        and node.type == "expression_statement"
+        and node.named_child_count == 1
+        and node.named_children[0].type == "string"
+    )
+
+
+def rest_of_function_body(src: bytes, first: Node, last: Node) -> str:
+    """For a comment that opens a function body, the rest of the body.
+
+    Such a comment often describes the whole function (`// Returns true if
+    …`), and checking it for staleness needs all of it, not just the next
+    statement. A docstring before the comment doesn't count as code.
+    """
+    block = first.parent
+    if block is None or block.type != "block" or block.parent is None or block.parent.type not in FUNCTION_TYPES:
+        return ""
+    before = prev_code_sibling(first)
+    if before is not None and not (is_docstring(before) and prev_code_sibling(before) is None):
+        return ""
+    start = next_code_sibling(last)
+    end = next((n for n in reversed(block.named_children) if not is_comment(n)), None)
+    if start is None or end is None or end.start_byte < start.start_byte:
+        return ""
+    return code_text(src, start, end)
+
+
 def is_code_line(line: str) -> bool:
     s = line.strip()
     if s.startswith("#") and not s.startswith(("#[", "#![")):  # a Python comment, not a Rust attribute
@@ -492,7 +539,7 @@ def build_comment(path: str, group: list[Node], src: bytes, lang: Lang = RUST) -
             c.code_before = line_before(lines, first.start_point.row)
     else:
         c.code_before = code_text(src, prev_code_sibling(first))
-        c.code_after = following_code(src, last)
+        c.code_after = rest_of_function_body(src, first, last) or following_code(src, last)
     c.code_before = truncate(c.code_before, PRECEDING_MAX_CHARS)
     fit_budget(c)
     return c
@@ -661,17 +708,16 @@ def local_check(c: Comment) -> None:
 
 
 def apply_rules(p: dict[str, float], t: dict[str, float] = THRESHOLDS) -> list[tuple[str, float]]:
+    """Each question flags on its own; no score cancels another."""
     flags: list[tuple[str, float]] = []
-    if p["inconsistent"] > t["stale_inconsistent"]:
-        flags.append(("STALE", p["inconsistent"]))
-    if p["rationale"] > t["rationale_veto"]:
-        return flags
+    if p["stale"] > t["stale"]:
+        flags.append(("STALE", p["stale"]))
     if p["history"] > t["history"]:
         flags.append(("HISTORY", p["history"]))
-    if p["restates"] > t["redundant_restates"] and p["rationale"] < t["redundant_max_rationale"]:
-        flags.append(("REDUNDANT", p["restates"]))
-    if p["fragile"] > t["fragile"] and p["rationale"] < t["fragile_max_rationale"]:
-        flags.append(("FRAGILE", p["fragile"]))
+    if p["command"] > t["command"]:
+        flags.append(("COMMAND", p["command"]))
+    if p["nonlocal"] < t["nonlocal"]:
+        flags.append(("WHAT_ONLY", round(1 - p["nonlocal"], 4)))
     return flags
 
 
@@ -929,27 +975,35 @@ def write_csv(path: Path, comments: list[Comment]) -> None:
 
 
 def evaluate_csv(path: Path, t: dict[str, float] = THRESHOLDS) -> str:
-    """Score the current rules against a hand-labeled CSV (no API calls)."""
-    counts = {"keep": [0, 0], "cut": [0, 0], "rewrite": [0, 0]}  # [total, flagged]
+    """Score the current rules against a hand-labeled CSV (no API calls).
+
+    Labels: `keep`, or the kind of problem: `stale`, `history`, `command`,
+    `what`. The older `cut` and `rewrite` count as problems of no stated kind.
+    """
+    counts: dict[str, list[int]] = {}  # label -> [total, flagged, flagged by its own flag]
     false_flags: list[str] = []
     with path.open(newline="") as f:
         for row in csv.DictReader(f):
             label = (row.get("label") or "").strip().lower()
-            if label not in counts:
+            if label not in ("keep", "cut", "rewrite", *LABEL_FLAGS):
                 continue
-            flags = apply_rules({k: float(row[k]) for k in QUESTION_NAMES}, t)
-            counts[label][0] += 1
-            if flags:
-                counts[label][1] += 1
-                if label == "keep":
-                    loc = f"{row['file']}:{row['start_line']}"
-                    false_flags.append(f"  {loc}  {' '.join(c for c, _ in flags)}")
-    bad_total = counts["cut"][0] + counts["rewrite"][0]
-    bad_caught = counts["cut"][1] + counts["rewrite"][1]
-    out = [f"{label:<8} {flagged:>4} flagged / {total:>4}" for label, (total, flagged) in counts.items()]
-    if bad_total:
-        out.append(f"recall on cut+rewrite: {bad_caught / bad_total:.0%}")
-    if counts["keep"][0]:
+            flags = [cat for cat, _ in apply_rules({k: float(row[k]) for k in QUESTION_NAMES}, t)]
+            c = counts.setdefault(label, [0, 0, 0])
+            c[0] += 1
+            c[1] += bool(flags)
+            c[2] += LABEL_FLAGS.get(label) in flags
+            if flags and label == "keep":
+                false_flags.append(f"  {row['file']}:{row['start_line']}  {' '.join(flags)}")
+    out = []
+    for label, (total, flagged, own) in sorted(counts.items()):
+        line = f"{label:<8} {flagged:>4} flagged / {total:>4}"
+        if label in LABEL_FLAGS:
+            line += f"   ({own} by {LABEL_FLAGS[label]})"
+        out.append(line)
+    bad = [c for label, c in counts.items() if label != "keep"]
+    if bad:
+        out.append(f"recall on problems: {sum(c[1] for c in bad) / sum(c[0] for c in bad):.0%}")
+    if "keep" in counts:
         out.append(f"false-flag rate on keep: {counts['keep'][1] / counts['keep'][0]:.0%}")
     if false_flags:
         out.append("false flags:")

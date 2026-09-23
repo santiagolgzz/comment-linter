@@ -19,8 +19,8 @@ def extract_src(tmp_path: Path, src: str) -> list[cl.Comment]:
 
 
 def probs(**overrides: float) -> dict[str, float]:
-    p = {"restates": 0.1, "rationale": 0.1, "inconsistent": 0.1, "history": 0.1, "fragile": 0.1}
-    p.update(overrides)
+    p = {"stale": 0.1, "history": 0.1, "command": 0.1, "nonlocal": 0.9}
+    p.update({k.rstrip("_"): v for k, v in overrides.items()})  # `nonlocal_`: `nonlocal` is a keyword
     return p
 
 
@@ -168,25 +168,25 @@ def test_local_check_statuses():
 # --- rules -------------------------------------------------------------------
 
 
-def test_rules_from_spec_table():
+def test_each_question_flags_on_its_own():
     assert cl.apply_rules(probs()) == []
-    assert cl.apply_rules(probs(inconsistent=0.8)) == [("STALE", 0.8)]
-    assert cl.apply_rules(probs(inconsistent=0.75)) == []
+    assert cl.apply_rules(probs(stale=0.8)) == [("STALE", 0.8)]
+    assert cl.apply_rules(probs(stale=0.75)) == []
     assert cl.apply_rules(probs(history=0.81)) == [("HISTORY", 0.81)]
-    assert cl.apply_rules(probs(restates=0.95, rationale=0.1)) == [("REDUNDANT", 0.95)]
-    assert cl.apply_rules(probs(restates=0.95, rationale=0.25)) == []
-    assert cl.apply_rules(probs(fragile=0.9, rationale=0.25)) == [("FRAGILE", 0.9)]
-    assert cl.apply_rules(probs(fragile=0.9, rationale=0.35)) == []
+    assert cl.apply_rules(probs(command=0.9)) == [("COMMAND", 0.9)]
+    assert cl.apply_rules(probs(nonlocal_=0.1)) == [("WHAT_ONLY", 0.9)]
+    assert cl.apply_rules(probs(nonlocal_=0.2)) == []
 
 
-def test_rationale_veto_spares_all_but_stale():
-    p = probs(rationale=0.75, history=0.95, inconsistent=0.9)
-    assert cl.apply_rules(p) == [("STALE", 0.9)]
+def test_a_useful_fact_does_not_excuse_history():
+    # A comment can carry a real non-local fact and still be a memorial.
+    p = probs(history=0.9, nonlocal_=0.95)
+    assert cl.apply_rules(p) == [("HISTORY", 0.9)]
 
 
 def test_multiple_flags():
-    p = probs(history=0.9, restates=0.95, fragile=0.9, rationale=0.05)
-    assert [f for f, _ in cl.apply_rules(p)] == ["HISTORY", "REDUNDANT", "FRAGILE"]
+    p = probs(stale=0.9, history=0.9, command=0.9, nonlocal_=0.05)
+    assert [f for f, _ in cl.apply_rules(p)] == ["STALE", "HISTORY", "COMMAND", "WHAT_ONLY"]
 
 
 # --- Jev client and CLI ------------------------------------------------------
@@ -234,7 +234,7 @@ def test_request_shape(tmp_path, api_key, capsys):
     body = fake.bodies[0]
     assert body["model"] == cl.MODEL == "typesafe/jev-1.13-20260917"
     assert body["provider"] == {"zdr": True, "data_collection": "deny"}
-    assert set(body["questions"]) == {"restates", "rationale", "inconsistent", "history", "fragile"}
+    assert set(body["questions"]) == {"stale", "history", "command", "nonlocal"}
     assert all(q["type"] == "noul" for q in body["questions"].values())
     assert set(body["state"]) == {"file", "item", "comment_kind", "comment", "code_before", "code_after"}
     # Only comments that survive the local checks are sent.
@@ -244,11 +244,11 @@ def test_request_shape(tmp_path, api_key, capsys):
 
 
 def test_report_and_exit_code(tmp_path, api_key, capsys):
-    fake = FakeJev({"Loop over": {"restates": 0.97}, "new parser": {"history": 0.91}})
+    fake = FakeJev({"Loop over": {"stale": 0.97}, "new parser": {"history": 0.91}})
     code, out = run_cli(["--no-cache", str(FIXTURE)], fake, capsys)
     assert code == 1
     lines = out.splitlines()
-    assert lines[0].split() == ["tests/fixtures/sample.rs:14-15", "REDUNDANT", "0.97"]
+    assert lines[0].split() == ["tests/fixtures/sample.rs:14-15", "STALE", "0.97"]
     assert lines[1].split() == ["tests/fixtures/sample.rs:19", "COMMENTED_CODE", "-"]
     assert lines[2].split() == ["tests/fixtures/sample.rs:25", "HISTORY", "0.91"]
     assert "TODO: evict old entries" in out
@@ -364,14 +364,14 @@ def test_missing_key(tmp_path, monkeypatch, capsys):
 
 def test_cache_skips_unchanged_comments(tmp_path, api_key, capsys):
     f = tmp_path / "a.rs"
-    f.write_text("fn f() {\n    // note one\n    g();\n    // note two\n    h();\n}\n")
+    f.write_text("fn f() {\n    a();\n    // note one\n    g();\n    // note two\n    h();\n}\n")
     cache = tmp_path / "cache.json"
     fake = FakeJev({"note two": {"history": 0.9}})
     code, _ = run_cli(["--cache", str(cache), str(f)], fake, capsys)
     assert len(fake.bodies) == 2 and code == 1
 
     # Change the code under one comment: only that comment is re-sent.
-    f.write_text("fn f() {\n    // note one\n    g();\n    // note two\n    h2();\n}\n")
+    f.write_text("fn f() {\n    a();\n    // note one\n    g();\n    // note two\n    h2();\n}\n")
     fake2 = FakeJev({"note two": {"history": 0.9}})
     code, out = run_cli(["--cache", str(cache), str(f)], fake2, capsys)
     assert [b["state"]["comment"] for b in fake2.bodies] == ["// note two"]
@@ -380,12 +380,12 @@ def test_cache_skips_unchanged_comments(tmp_path, api_key, capsys):
 
 
 def test_json_output(tmp_path, api_key, capsys):
-    fake = FakeJev({"Loop over": {"restates": 0.97}})
+    fake = FakeJev({"Loop over": {"stale": 0.97}})
     _, out = run_cli(["--no-cache", "--json", str(FIXTURE)], fake, capsys)
     data = json.loads(out)
     assert [r["start_line"] for r in data["records"]] == [14, 19]
     r = data["records"][0]
-    assert r["flags"] == [{"category": "REDUNDANT", "score": 0.97}]
+    assert r["flags"] == [{"category": "STALE", "score": 0.97}]
     assert set(r["probabilities"]) == set(cl.QUESTION_NAMES)
     assert r["code_after"].startswith("for child in")
     assert data["summary"]["flagged"] == 2
@@ -396,11 +396,11 @@ def test_json_output(tmp_path, api_key, capsys):
 
 def test_all_shows_unflagged(tmp_path, api_key, capsys):
     _, out = run_cli(["--no-cache", "--all", str(FIXTURE)], FakeJev({}), capsys)
-    assert "ok" in out and "restates=0.10" in out
+    assert "ok" in out and "stale=0.10" in out
 
 
 def test_csv_and_evaluate(tmp_path, api_key, capsys):
-    fake = FakeJev({"Loop over": {"restates": 0.97}, "count the ids": {"restates": 0.95}})
+    fake = FakeJev({"Loop over": {"stale": 0.97}, "count the ids": {"stale": 0.95}})
     out_csv = tmp_path / "dump.csv"
     run_cli(["--no-cache", "--csv", str(out_csv), str(FIXTURE)], fake, capsys)
     assert out_csv.read_text().splitlines()[0].startswith("file,start_line,end_line,label,comment,code_before")
@@ -417,9 +417,9 @@ def test_csv_and_evaluate(tmp_path, api_key, capsys):
     code = cl.run(["--evaluate", str(out_csv)])
     report = capsys.readouterr().out
     assert code == 0
-    assert "recall on cut+rewrite: 100%" in report
+    assert "recall on problems: 100%" in report
     assert "false-flag rate on keep: 25%" in report
-    assert "sample.rs:20  REDUNDANT" in report
+    assert "sample.rs:20  STALE" in report
 
 
 def test_dry_run_needs_no_key(tmp_path, monkeypatch, capsys):
@@ -504,7 +504,7 @@ def test_overlapping_paths_are_read_once(tmp_path):
 def test_cost_falls_back_to_token_count(tmp_path, api_key, capsys):
     f = tmp_path / "a.rs"
     f.write_text("fn f() {\n    // note\n    g();\n}\n")
-    answers = {k: {"type": "noul", "noul": 0.1} for k in cl.QUESTION_NAMES}
+    answers = {k: {"type": "noul", "noul": v} for k, v in probs().items()}
 
     def handler(request):
         return httpx.Response(200, json={"answers": answers, "usage": {"input_tokens": 1_000_000, "output_tokens": 0}})
@@ -526,12 +526,12 @@ def test_out_of_range_probability_is_an_error(tmp_path, api_key, capsys, bad):
 
 
 def test_probe_prints_raw_and_decoded(api_key, capsys):
-    code, out = run_cli(["--probe"], FakeJev({"Loop over": {"restates": 0.97}}), capsys)
+    code, out = run_cli(["--probe"], FakeJev({"Loop over": {"stale": 0.97}}), capsys)
     assert code == 0
     assert f'"model": "{cl.MODEL}"' in out
     assert "== response: HTTP 200 ==" in out
-    assert "restates=0.97" in out
-    assert "flags: REDUNDANT 0.97" in out
+    assert "stale=0.97" in out
+    assert "flags: STALE 0.97" in out
     assert "from usage.cost" in out
 
 
@@ -722,3 +722,46 @@ def test_line_context_drops_other_trailing_comments(tmp_path):
     _, c = extract_py(tmp_path, src)
     assert c.code_before == '{"amount": 100.0},'
     assert c.code_after == '{"amount": -50.0},'
+
+
+def test_comment_opening_a_function_gets_the_whole_body(tmp_path):
+    src = (
+        "fn remove(&mut self) -> bool {\n"
+        "    // Returns true if the item was fully removed\n"
+        "    let Some(have) = self.get() else {\n"
+        "        return false;\n"
+        "    };\n"
+        "    // Saturate instead of erroring.\n"
+        "    *have = have.saturating_sub(1);\n"
+        "    true\n"
+        "}\n"
+    )
+    first, second = extract_src(tmp_path, src)
+    assert first.code_after.endswith("*have = have.saturating_sub(1);\ntrue")
+    assert "Saturate" not in first.code_after
+    # Later comments still get just the next statement.
+    assert second.code_after == "*have = have.saturating_sub(1);"
+
+
+def test_python_comment_after_docstring_gets_the_whole_body(tmp_path):
+    src = 'def f():\n    """Doc."""\n    # Returns the total\n    x = 1\n    return x\n'
+    [c] = extract_py(tmp_path, src)
+    assert c.code_after == "x = 1\nreturn x"
+
+
+def test_evaluate_reports_each_problem_kind(tmp_path, capsys):
+    rows = [
+        {"label": "stale", "stale": "0.9", "history": "0.1", "command": "0.1", "nonlocal": "0.9"},
+        {"label": "history", "stale": "0.9", "history": "0.1", "command": "0.1", "nonlocal": "0.9"},
+        {"label": "keep", "stale": "0.1", "history": "0.1", "command": "0.1", "nonlocal": "0.9"},
+    ]
+    path = tmp_path / "l.csv"
+    with path.open("w", newline="") as fh:
+        w = csv.DictWriter(fh, fieldnames=["file", "start_line", *rows[0]])
+        w.writeheader()
+        w.writerows({"file": "a.rs", "start_line": i, **r} for i, r in enumerate(rows))
+    out = cl.evaluate_csv(path)
+    assert "stale       1 flagged /    1   (1 by STALE)" in out
+    assert "history     1 flagged /    1   (0 by HISTORY)" in out
+    assert "recall on problems: 100%" in out
+    assert "false-flag rate on keep: 0%" in out
