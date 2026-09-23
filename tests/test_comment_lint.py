@@ -540,3 +540,17 @@ def test_probe_reports_shape_mismatch(api_key, capsys):
     code, out = run_cli(["--probe"], lambda r: httpx.Response(200, json=wrong), capsys)
     assert code == 2
     assert "could not decode answers" in out
+
+
+def test_demo_matches_readme(monkeypatch, capsys):
+    # README.md quotes this output; update both together.
+    monkeypatch.chdir(Path(__file__).resolve().parent.parent)
+    assert cl.run(["--dry-run", "examples/demo.rs"]) == 0
+    assert capsys.readouterr().out == (
+        "examples/demo.rs:28   COMMENTED_CODE   -\n"
+        "\n"
+        "examples/demo.rs:33   TODO   TODO: cache this if inventories get large\n"
+        "--\n"
+        "1 flagged / 1 checked · 1 TODOs · cost $0.0000\n"
+        "5 comments would be sent to Jev\n"
+    )
