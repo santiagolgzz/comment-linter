@@ -104,6 +104,8 @@ MAX_IN_FLIGHT = 4
 MAX_TRIES = 3
 REQUEST_TIMEOUT = 30.0
 RETRY_STATUSES = {429, 502, 503, 504}
+# Jev's input price in USD, used only when a response carries no `usage.cost`.
+PRICE_PER_MTOK = 0.042
 # About 1,000 tokens at ~4 characters per token.
 CONTEXT_BUDGET_CHARS = 4000
 # The preceding statement is there for ordering context; a whole preceding
@@ -135,6 +137,7 @@ class Comment:
     probs: dict[str, float] = field(default_factory=dict)
     flags: list[tuple[str, float | None]] = field(default_factory=list)
     cost: float = 0.0
+    cost_estimated: bool = False
     error: str = ""
 
     def location(self) -> str:
@@ -533,7 +536,29 @@ def cache_key(c: Comment) -> str:
 
 def parse_answers(data: dict) -> dict[str, float]:
     answers = data["answers"]
-    return {name: float(answers[name]["noul"]) for name in QUESTION_NAMES}
+    probs = {}
+    for name in QUESTION_NAMES:
+        value = answers[name]["noul"]
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not 0 <= value <= 1:
+            raise ValueError(f"{name}.noul is {value!r}, not a probability")
+        probs[name] = float(value)
+    return probs
+
+
+def response_cost(data: dict) -> tuple[float, bool]:
+    """USD cost of one call, and whether it was estimated from token counts.
+
+    OpenRouter reports `usage.cost`. TypeSafe's own API reports only token
+    counts, so fall back to those if `cost` is missing.
+    """
+    usage = data.get("usage") or {}
+    cost = usage.get("cost")
+    if isinstance(cost, (int, float)):
+        return float(cost), False
+    tokens = usage.get("input_tokens", usage.get("prompt_tokens"))
+    if isinstance(tokens, (int, float)):
+        return tokens * PRICE_PER_MTOK / 1e6, True
+    return 0.0, True
 
 
 async def ask_jev(client: httpx.AsyncClient, c: Comment, sem: asyncio.Semaphore, backoff: float) -> None:
@@ -561,7 +586,7 @@ async def ask_jev(client: httpx.AsyncClient, c: Comment, sem: asyncio.Semaphore,
         except (ValueError, KeyError, TypeError) as e:
             c.status, c.error = "error", f"bad response: {e!r}"
             return
-        c.cost = float((data.get("usage") or {}).get("cost") or 0.0)
+        c.cost, c.cost_estimated = response_cost(data)
         c.status = "judged"
         return
     c.status, c.error = "error", f"gave up after {MAX_TRIES} tries ({last_error})"
@@ -634,6 +659,7 @@ def summary(comments: list[Comment]) -> dict:
         "cached": sum(1 for c in comments if c.status == "cached"),
         "skipped": sum(1 for c in comments if c.status == "skipped"),
         "cost": sum(c.cost for c in comments),
+        "cost_estimated": any(c.cost_estimated for c in comments),
     }
 
 
@@ -666,7 +692,7 @@ def text_report(comments: list[Comment], show_all: bool) -> str:
     footer = f"{s['flagged']} flagged / {s['checked']} checked · {s['todos']} TODOs"
     if s["errors"]:
         footer += f" · {s['errors']} errors"
-    footer += f" · cost ${s['cost']:.4f}"
+    footer += f" · cost {'~' if s['cost_estimated'] else ''}${s['cost']:.4f}"
     if s["cached"]:
         footer += f" ({s['cached']} cached)"
     lines.append(footer)
@@ -743,6 +769,59 @@ def evaluate_csv(path: Path, t: dict[str, float] = THRESHOLDS) -> str:
     return "\n".join(out)
 
 
+# --- Probe -------------------------------------------------------------------
+
+PROBE_COMMENT = Comment(
+    file="crates/agent-sap/src/session.rs",
+    start_line=1,
+    end_line=1,
+    kind="line",
+    text="// Loop over the children and collect their ids",
+    trailing=False,
+    item="fn attach_session(&self, id: &str) -> Result<Session>",
+    code_before="let mut ids = Vec::new();",
+    code_after="for child in node.children() {\n    ids.push(child.id());\n}",
+)
+
+
+async def probe(api_key: str, transport: httpx.AsyncBaseTransport | None = None) -> int:
+    """Send the spec's example request once and show what came back.
+
+    The request and response shapes come from the docs, not from a live call.
+    A field that decodes wrong shows up here next to the raw JSON.
+    """
+    body = request_body(PROBE_COMMENT)
+    print("== request ==")
+    print(json.dumps({k: v for k, v in body.items() if k != "questions"}, indent=2))
+    print(f"(plus the {len(QUESTIONS)} questions: {', '.join(QUESTION_NAMES)})")
+    headers = {"Authorization": f"Bearer {api_key}"}
+    async with httpx.AsyncClient(headers=headers, timeout=REQUEST_TIMEOUT, transport=transport) as client:
+        resp = await client.post(API_URL, json=body)
+    print(f"\n== response: HTTP {resp.status_code} ==")
+    try:
+        data = resp.json()
+        print(json.dumps(data, indent=2))
+    except ValueError:
+        print(resp.text)
+        return 2
+    if resp.status_code != 200:
+        return 2
+    print("\n== decoded ==")
+    try:
+        p = parse_answers(data)
+    except (KeyError, TypeError, ValueError) as e:
+        print(f"could not decode answers: {e!r}")
+        print("Compare `answers.<name>.noul` in parse_answers() with the raw JSON above.")
+        return 2
+    print(fmt_probs(p))
+    flags = apply_rules(p)
+    print("flags:", " ".join(f"{cat} {score:.2f}" for cat, score in flags) or "none")
+    cost, estimated = response_cost(data)
+    how = "estimated from input tokens" if estimated else "from usage.cost"
+    print(f"cost: ${cost:.6f} ({how})")
+    return 0
+
+
 # --- CLI ---------------------------------------------------------------------
 
 
@@ -754,6 +833,7 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
     ap.add_argument("--csv", metavar="PATH", help="write every judged comment with its probabilities (for labeling)")
     ap.add_argument("--evaluate", metavar="PATH", help="score the rules against a labeled CSV; no API calls")
     ap.add_argument("--dry-run", action="store_true", help="extract and run local checks only; no API calls")
+    ap.add_argument("--probe", action="store_true", help="send one example request and print the raw response")
     ap.add_argument("--cache", default=DEFAULT_CACHE, metavar="PATH", help=f"answer cache (default: {DEFAULT_CACHE})")
     ap.add_argument("--no-cache", action="store_true", help="neither read nor write the cache")
     return ap.parse_args(argv)
@@ -765,6 +845,13 @@ def run(argv: list[str] | None = None, transport: httpx.AsyncBaseTransport | Non
     if args.evaluate:
         print(evaluate_csv(Path(args.evaluate)))
         return 0
+
+    if args.probe:
+        api_key = os.environ.get("OPENROUTER_API_KEY", "")
+        if not api_key:
+            print("comment-lint: OPENROUTER_API_KEY is not set", file=sys.stderr)
+            return 2
+        return asyncio.run(probe(api_key, transport=transport))
 
     comments: list[Comment] = []
     for f in find_rust_files(args.paths):

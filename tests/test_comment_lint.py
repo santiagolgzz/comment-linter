@@ -448,3 +448,44 @@ def test_overlapping_paths_are_read_once(tmp_path):
     f = tmp_path / "a.rs"
     f.write_text("fn f() {}\n")
     assert cl.find_rust_files([str(tmp_path), str(f)]) == [f.resolve()]
+
+
+def test_cost_falls_back_to_token_count(tmp_path, api_key, capsys):
+    f = tmp_path / "a.rs"
+    f.write_text("fn f() {\n    // note\n    g();\n}\n")
+    answers = {k: {"type": "noul", "noul": 0.1} for k in cl.QUESTION_NAMES}
+
+    def handler(request):
+        return httpx.Response(200, json={"answers": answers, "usage": {"input_tokens": 1_000_000, "output_tokens": 0}})
+
+    code, out = run_cli(["--no-cache", str(f)], handler, capsys)
+    assert code == 0
+    assert out.splitlines()[-1].endswith("cost ~$0.0420")
+
+
+@pytest.mark.parametrize("bad", [1.5, -0.1, "0.5", None, True])
+def test_out_of_range_probability_is_an_error(tmp_path, api_key, capsys, bad):
+    f = tmp_path / "a.rs"
+    f.write_text("fn f() {\n    // note\n    g();\n}\n")
+    answers = {k: {"noul": 0.1} for k in cl.QUESTION_NAMES}
+    answers["history"] = {"noul": bad}
+    code, out = run_cli(["--no-cache", str(f)], lambda r: httpx.Response(200, json={"answers": answers}), capsys)
+    assert code == 2
+    assert "ERROR" in out and "history.noul" in out
+
+
+def test_probe_prints_raw_and_decoded(api_key, capsys):
+    code, out = run_cli(["--probe"], FakeJev({"Loop over": {"restates": 0.97}}), capsys)
+    assert code == 0
+    assert '"model": "typesafe/jev-1.13"' in out
+    assert "== response: HTTP 200 ==" in out
+    assert "restates=0.97" in out
+    assert "flags: REDUNDANT 0.97" in out
+    assert "from usage.cost" in out
+
+
+def test_probe_reports_shape_mismatch(api_key, capsys):
+    wrong = {"answers": {k: {"probability": 0.5} for k in cl.QUESTION_NAMES}}
+    code, out = run_cli(["--probe"], lambda r: httpx.Response(200, json=wrong), capsys)
+    assert code == 2
+    assert "could not decode answers" in out

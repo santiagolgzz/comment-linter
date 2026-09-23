@@ -10,6 +10,8 @@ Design and rationale: [SPEC.md](SPEC.md).
 
 Needs [uv](https://docs.astral.sh/uv/). Dependencies are pinned inside the script.
 
+**First time:** run `uv run comment_lint.py --probe`. It sends the spec's example request once and prints the raw response next to what the tool decoded from it. The API shapes here come from the docs and from two other Jev projects, not from a live call, so check this before trusting a full run.
+
 ```sh
 export OPENROUTER_API_KEY=...
 uv run comment_lint.py path/to/rust-sap-agent
@@ -33,6 +35,7 @@ crates/agent-sap/src/session.rs:12   TODO   TODO: evict old entries
 | `--csv PATH` | Write every Jev-judged comment with its probabilities and an empty `label` column. |
 | `--evaluate PATH` | Score the current rules against a labeled CSV. No API calls. |
 | `--dry-run` | Extract and run the local checks only. No API key needed. |
+| `--probe` | Send one example request and print the raw response and the decoded answers. |
 | `--cache PATH` / `--no-cache` | Answer cache, default `.comment-lint-cache.json`. |
 
 **Exit codes:** `0` clean · `1` something was flagged · `2` setup error (missing key, HTTP 401/403), or some comments ended as `ERROR` with nothing flagged.
@@ -47,6 +50,8 @@ crates/agent-sap/src/session.rs:12   TODO   TODO: evict old entries
 Each request carries the comment, the enclosing function or type signature, the preceding statement, and the following statement (for a trailing comment, the statement it trails). An item's attributes come with it. Inside macro bodies, where tree-sitter only sees a flat run of tokens, the context comes from the surrounding source lines instead. Context is capped at about 1,000 tokens, trimming the following code first.
 
 Every request sets `provider: {"zdr": true, "data_collection": "deny"}`, so it fails rather than reach a provider that retains or trains on data. The model is pinned to `typesafe/jev-1.13`.
+
+The cost in the footer comes from `usage.cost`. If a response has no `cost`, the tool estimates it from `usage.input_tokens` at $0.042 per million tokens and marks the total with `~`. A response whose five answers aren't all probabilities between 0 and 1 is reported as `ERROR`.
 
 ## Rules
 
