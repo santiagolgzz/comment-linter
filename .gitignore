@@ -216,3 +216,7 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# comment-lint answer cache
+.comment-lint-cache.json
+.comment-lint-cache.json.tmp
