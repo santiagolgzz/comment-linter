@@ -103,7 +103,18 @@ THRESHOLDS = {
 MAX_IN_FLIGHT = 4
 MAX_TRIES = 3
 REQUEST_TIMEOUT = 30.0
-RETRY_STATUSES = {429, 502, 503, 504}
+# Per OpenRouter's error docs: 408 timeout, 429 rate limit, 502 model down,
+# 503 no provider available right now.
+RETRY_STATUSES = {408, 429, 502, 503, 504}
+# Failures that no retry and no other comment can get past: stop the run.
+FATAL_STATUSES = {
+    401: "the API key was rejected",
+    402: "the account is out of credits",
+    404: "the model was not found, or no provider passes the privacy settings (zdr, data_collection)",
+}
+# A 503 with this message is the privacy filter again, not a passing outage.
+NO_ROUTE_RE = re.compile(r"routing requirements|no allowed providers", re.IGNORECASE)
+MAX_RETRY_AFTER = 30.0
 # Jev's input price in USD, used only when a response carries no `usage.cost`.
 PRICE_PER_MTOK = 0.042
 # About 1,000 tokens at ~4 characters per token.
@@ -561,24 +572,49 @@ def response_cost(data: dict) -> tuple[float, bool]:
     return 0.0, True
 
 
+def error_message(resp: httpx.Response) -> str:
+    """`HTTP <status>: <message>`, using OpenRouter's `error.message` when present."""
+    try:
+        message = str(resp.json()["error"]["message"])
+    except (ValueError, KeyError, TypeError):
+        message = resp.text
+    return f"HTTP {resp.status_code}: {message[:300]}"
+
+
+def retry_after(resp: httpx.Response) -> float:
+    """Seconds from a numeric Retry-After header, capped; 0 if absent or unparseable."""
+    try:
+        return min(max(float(resp.headers.get("retry-after", "0")), 0.0), MAX_RETRY_AFTER)
+    except ValueError:
+        return 0.0
+
+
 async def ask_jev(client: httpx.AsyncClient, c: Comment, sem: asyncio.Semaphore, backoff: float) -> None:
     last_error = ""
+    delay = 0.0
     for attempt in range(MAX_TRIES):
         if attempt:
-            await asyncio.sleep(backoff * 2 ** (attempt - 1))
+            await asyncio.sleep(delay)
+        delay = backoff * 2**attempt
         try:
             async with sem:
                 resp = await client.post(API_URL, json=request_body(c))
         except (httpx.TimeoutException, httpx.TransportError) as e:
             last_error = f"{type(e).__name__}"
             continue
-        if resp.status_code in (401, 403):
-            raise FatalApiError(f"HTTP {resp.status_code}: {resp.text[:300]}")
-        if resp.status_code in RETRY_STATUSES:
-            last_error = f"HTTP {resp.status_code}"
+        status = resp.status_code
+        if status in FATAL_STATUSES:
+            raise FatalApiError(f"{error_message(resp)}\n({FATAL_STATUSES[status]})")
+        if status == 503 and NO_ROUTE_RE.search(resp.text):
+            raise FatalApiError(f"{error_message(resp)}\n({FATAL_STATUSES[404]})")
+        if status in RETRY_STATUSES:
+            last_error = f"HTTP {status}"
+            delay = max(delay, retry_after(resp))
             continue
-        if resp.status_code != 200:
-            c.status, c.error = "error", f"HTTP {resp.status_code}: {resp.text[:300]}"
+        if status != 200:
+            # 400, or 403 (a moderation or guardrail block can be about this
+            # comment's content alone): fail this comment, keep the run going.
+            c.status, c.error = "error", error_message(resp)
             return
         try:
             data = resp.json()

@@ -297,12 +297,63 @@ def test_timeout_is_retried(tmp_path, api_key, capsys):
     assert code == 0 and len(calls) == 2
 
 
-def test_auth_error_aborts(tmp_path, api_key, capsys):
+def or_error(status: int, message: str) -> httpx.Response:
+    return httpx.Response(status, json={"error": {"code": status, "message": message}})
+
+
+@pytest.mark.parametrize(
+    "status, message, hint",
+    [
+        (401, "No auth credentials found", "API key was rejected"),
+        (402, "Insufficient credits", "out of credits"),
+        (404, "No allowed providers are available for the selected model.", "privacy settings"),
+        (503, "There is no available model provider that meets your routing requirements", "privacy settings"),
+    ],
+)
+def test_fatal_errors_stop_the_run(tmp_path, api_key, capsys, status, message, hint):
     f = tmp_path / "a.rs"
-    f.write_text("fn f() {\n    // note\n    g();\n}\n")
-    code = cl.run(["--no-cache", str(f)], transport=httpx.MockTransport(lambda r: httpx.Response(401, text="no")))
+    f.write_text("fn f() {\n    // one\n    g();\n    // two\n    h();\n}\n")
+    calls = []
+
+    def handler(request):
+        calls.append(1)
+        return or_error(status, message)
+
+    code = cl.run(["--no-cache", str(f)], transport=httpx.MockTransport(handler), backoff=0)
+    err = capsys.readouterr().err
     assert code == 2
-    assert "HTTP 401" in capsys.readouterr().err
+    assert f"HTTP {status}: {message}" in err and hint in err
+    assert len(calls) <= cl.MAX_IN_FLIGHT  # stopped, not retried per comment
+
+
+def test_forbidden_fails_only_that_comment(tmp_path, api_key, capsys):
+    f = tmp_path / "a.rs"
+    f.write_text("fn f() {\n    // one\n    g();\n    // two\n    h();\n}\n")
+
+    def handler(request):
+        if "one" in json.loads(request.content)["state"]["comment"]:
+            return or_error(403, "Flagged by moderation")
+        return jev_response(probs())
+
+    code, out = run_cli(["--no-cache", str(f)], handler, capsys)
+    assert code == 2
+    assert "ERROR" in out and "HTTP 403: Flagged by moderation" in out
+    assert "0 flagged / 2 checked" in out
+
+
+def test_retry_after_is_read_and_capped():
+    assert cl.retry_after(httpx.Response(429, headers={"Retry-After": "2"})) == 2.0
+    assert cl.retry_after(httpx.Response(429, headers={"Retry-After": "9999"})) == cl.MAX_RETRY_AFTER
+    assert cl.retry_after(httpx.Response(429, headers={"Retry-After": "Wed, 21 Oct 2026 07:28:00 GMT"})) == 0.0
+    assert cl.retry_after(httpx.Response(429)) == 0.0
+
+
+def test_timeout_status_is_retried(tmp_path, api_key, capsys):
+    f = tmp_path / "a.rs"
+    f.write_text("fn f() {\n    // note one\n    g();\n}\n")
+    fake = FakeJev({}, fail_first={"// note one": [408]})
+    code, _ = run_cli(["--no-cache", str(f)], fake, capsys)
+    assert code == 0 and len(fake.bodies) == 2
 
 
 def test_missing_key(tmp_path, monkeypatch, capsys):

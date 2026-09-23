@@ -10,7 +10,7 @@ Design and rationale: [SPEC.md](SPEC.md).
 
 Needs [uv](https://docs.astral.sh/uv/). Dependencies are pinned inside the script.
 
-**First time:** run `uv run comment_lint.py --probe`. It sends the spec's example request once and prints the raw response next to what the tool decoded from it. The API shapes here come from the docs and from two other Jev projects, not from a live call, so check this before trusting a full run.
+**First time:** run `uv run comment_lint.py --probe`. It sends the spec's example request once and prints the raw response next to what the tool decoded from it. The request and response shapes match OpenRouter's published OpenAPI spec and its Jev cookbook, but have not been tried against the live service yet.
 
 ```sh
 export OPENROUTER_API_KEY=...
@@ -45,7 +45,15 @@ crates/agent-sap/src/session.rs:12   TODO   TODO: evict old entries
 1. **Skipped, no API call:** doc comments (`///`, `//!`, `/** */`, `/*! */`), empty or decorative lines, tool directives (`// SAFETY:` in any case, `rustfmt::`, `clippy::`, `@generated`, …), and license headers above the first code in a file.
 2. **Listed as TODO, not judged:** blocks containing `TODO`/`FIXME` (upper case anywhere, any case at the start of a line).
 3. **Flagged `COMMENTED_CODE` locally:** the text parses cleanly as Rust in some container (function body, item, impl, struct, match) *and* shows strong code evidence (`;`, `=`, `::`, `->`, braces, calls, paths, declarations, control flow). A bare identifier, keyword-plus-word, lone number, or comparison doesn't count. In a block that mixes prose and code, one blank-line-separated paragraph that is clearly a statement or item is enough.
-4. **Sent to Jev:** everything else. One comment per request, at most 4 in flight. HTTP 429/502/503/504 and timeouts are retried with backoff, up to 3 tries in total, after which the comment is reported as `ERROR`.
+4. **Sent to Jev:** everything else. One comment per request, at most 4 in flight.
+
+How API errors are handled:
+
+| Response | What happens |
+|---|---|
+| 408, 429, 502, 503, 504, or a network timeout | Retried with backoff, honoring `Retry-After` (up to 30 s). After 3 tries the comment is reported as `ERROR`. |
+| 401 bad key, 402 out of credits, 404 model not found or no provider passes the privacy flags, 503 "routing requirements" | The run stops with OpenRouter's message. Every other comment would fail the same way. |
+| 400, 403 (for example a moderation block) | Only that comment is reported as `ERROR`. The run continues. |
 
 Each request carries the comment, the enclosing function or type signature, the preceding statement, and the following statement (for a trailing comment, the statement it trails). An item's attributes come with it. Inside macro bodies, where tree-sitter only sees a flat run of tokens, the context comes from the surrounding source lines instead. Context is capped at about 1,000 tokens, trimming the following code first.
 
