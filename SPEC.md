@@ -2,7 +2,28 @@
 
 A small tool that flags low-value or stale-prone code comments, using TypeSafe's Jev decision model (via OpenRouter) as a cheap screener. First target: `rust-sap-agent`.
 
-Status: v1 prototype built as `comment_lint.py` (see README). Thresholds not yet calibrated.
+Status: v1 prototype built as `comment_lint.py` (see README). Thresholds not yet calibrated. The tool is being reworked around "What a good comment is" below; the sections after it describe v1.
+
+## What a good comment is
+
+Comments in these projects are read by coding agents, not people. An agent reads code about as fast as prose, so a comment is only worth its place if it tells the agent something the code can't.
+
+**A good comment states a non-local fact:** a cause and its effect that the nearby code doesn't show, because the link lives somewhere else (another file, a caller, an external API, runtime behavior). It is informative, not normative: it describes what happens and leaves the decision to the reader.
+
+> This reads the totals that `X` writes. Running it before `X` double-counts them.
+
+An agent asked to reorder this code now knows what it would break, and can decide what to do about it. Naming the other thing (`X`) lets it check the fact still holds.
+
+**The test for any comment:** would an agent reading only the nearby code miss this, and would missing it lead to a wrong change?
+
+Everything else costs something. Comments influence edits: an agent tends to bend a change to agree with what a comment says. So, from most to least harmful:
+
+1. **Stale:** says something the code no longer matches.
+2. **Memorializing:** records how the code got here (stories of past versions, pointers to design docs, plans, issues, phases or sessions) instead of facts about it now. That history belongs in commit messages and PRs.
+3. **Commands without facts:** "must", "never", "keep in sync" with nothing saying what happens otherwise.
+4. **What-only:** describes what the code visibly does. Little value, and mild pull toward the current shape.
+
+The best comments are also the likeliest to go stale, because they describe something elsewhere that can change without anyone touching this code. That is why checking for staleness matters most.
 
 ## Goal
 

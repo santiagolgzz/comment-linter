@@ -30,6 +30,7 @@ examples/demo.rs:33   TODO   TODO: cache this if inventories get large
 
 ## Contents
 
+- [What a good comment is](#what-a-good-comment-is)
 - [What it finds](#what-it-finds)
 - [Quick start](#quick-start)
 - [Reading the results](#reading-the-results)
@@ -40,6 +41,24 @@ examples/demo.rs:33   TODO   TODO: cache this if inventories get large
 - [FAQ](#faq)
 - [Tuning the thresholds](#tuning-the-thresholds)
 - [Contributing](#contributing)
+
+## What a good comment is
+
+These comments are written for the next coding agent, not a human reader. An agent reads code about as fast as prose, so a comment earns its place only by telling it something the code can't.
+
+A good comment states a **non-local fact**: a cause and effect you can't see from the nearby code. It informs rather than commands:
+
+```rust
+// This reads the totals that `apply_refunds` writes.
+// Running it before `apply_refunds` double-counts them.
+```
+
+The test: *would an agent reading only the nearby code miss this, and would missing it lead to a wrong change?*
+
+Comments that fail it aren't just noise. Agents tend to bend their changes to agree with what comments say, so a stale claim, a record of a past change, or an unexplained "must" pulls future edits toward decisions nobody can check. comment-lint exists to find those.
+
+> [!NOTE]
+> The checks below predate this principle and are being reworked around it. See [SPEC.md](SPEC.md#what-a-good-comment-is).
 
 ## What it finds
 
